@@ -18,7 +18,6 @@ function saveUsers() {
     fs.writeFileSync(DB_FILE, JSON.stringify(users, null, 2));
 }
 
-const pendingLinks = new Map();
 const bindingStates = new Map();
 
 // --- НАСТРОЙКА TELEGRAM БОТА ---
@@ -39,21 +38,27 @@ bot.on('text', async (ctx) => {
     const text = ctx.message.text;
 
     if (bindingStates.get(chatId) === 'WAITING_NICK') {
-        if (text.startsWith('/')) return; // Игнорируем случайные команды
+        if (text.startsWith('/')) return; // Игнорируем команды
         
         const nickname = text.trim();
-        const code = Math.floor(1000 + Math.random() * 9000).toString();
-        pendingLinks.set(code, { chatId, nickname });
-        bindingStates.delete(chatId);
-
-        ctx.reply(`⏳ Отлично! Ваш код подтверждения: \`${code}\`\n\nЗайдите на сервер под ником *${nickname}* и напишите: \`/link ${code}\``, { parse_mode: 'Markdown' });
-
-        // Пытаемся отправить сообщение игроку в игру через RCON
+        
         try {
-            const msg = `{"text":"В Telegram запрошена привязка. Ваш код: ${code}\\nНапишите /link ${code} для подтверждения.","color":"yellow"}`;
-            await executeRcon(`tellraw ${nickname} ${msg}`);
+            ctx.reply(`⏳ Отправляем запрос на сервер...`);
+            
+            // Вызываем RCON команду для открытия окна игроку. Передаем Никнейм и ChatID.
+            const response = await executeRcon(`linkrequest ${nickname} ${chatId}`);
+            
+            if (response.includes("OFFLINE")) {
+                ctx.reply(`❌ Игрок *${nickname}* сейчас не в игре!\nЗайдите на сервер и отправьте никнейм снова.`, { parse_mode: 'Markdown' });
+            } else if (response.includes("SUCCESS")) {
+                bindingStates.delete(chatId);
+                ctx.reply(`⏳ Отлично! На сервере появилось окно подтверждения.\n\nРазверните игру и нажмите зеленую кнопку ✅.`, { parse_mode: 'Markdown' });
+            } else {
+                ctx.reply(`⚠️ Сервер вернул неизвестный ответ.`);
+            }
         } catch (e) {
-            console.log(`Игрок ${nickname} оффлайн, сообщение tellraw не отправлено.`);
+            console.error("RCON Error:", e);
+            ctx.reply(`⚠️ Сервер Minecraft сейчас недоступен (ошибка RCON). Запустите сервер и попробуйте позже.`);
         }
     }
 });
@@ -207,35 +212,31 @@ async function executeRcon(command) {
         port: parseInt(process.env.RCON_PORT),
         password: process.env.RCON_PASSWORD
     });
-    await rcon.send(command);
+    const response = await rcon.send(command);
     await rcon.end();
+    return response;
 }
 
-// --- EXPRESS API (ПРИЕМ /link ОТ МАЙНКРАФТА) ---
+// --- EXPRESS API (ПРИЕМ ПОДТВЕРЖДЕНИЯ ОТ МАЙНКРАФТА ПОСЛЕ НАЖАТИЯ КНОПКИ В GUI) ---
 app.post('/api/link', (req, res) => {
-    const { code, uuid, name } = req.body;
-    console.log(`[API] Получен запрос на привязку. Код: ${code}, Игрок: ${name}`);
+    const { chatId, uuid, name } = req.body;
+    console.log(`[API] Получено подтверждение. ChatID: ${chatId}, Игрок: ${name}`);
     
     if (req.headers.authorization !== process.env.API_KEY) {
         console.log(`[API] Ошибка: Неверный API_KEY!`);
         return res.status(401).json({ error: 'Unauthorized: Wrong API_KEY' });
     }
 
-    const linkData = pendingLinks.get(code);
-    if (linkData) {
-        users[linkData.chatId] = { uuid, name };
-        saveUsers();
-        pendingLinks.delete(code);
-        
-        bot.telegram.sendMessage(linkData.chatId, `✅ Аккаунт *${name}* успешно привязан!`, {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([[Markup.button.callback('➡️ Открыть меню', 'menu_main')]])
-        });
-        res.json({ success: true });
-    } else {
-        console.log(`[API] Код ${code} не найден в памяти.`);
-        res.status(400).json({ error: 'Invalid code' });
-    }
+    // Сохраняем пользователя в базу бота
+    users[chatId] = { uuid, name };
+    saveUsers();
+    
+    bot.telegram.sendMessage(chatId, `✅ Аккаунт *${name}* успешно привязан!`, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('➡️ Открыть меню', 'menu_main')]])
+    });
+    
+    res.json({ success: true });
 });
 
 const PORT = process.env.PORT || 3000;
